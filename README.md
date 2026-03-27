@@ -17,32 +17,35 @@ It includes:
 
 This repo intentionally keeps deployment configuration small:
 
-- `default-values.yaml`
-- `dev-values.yaml`
+- `chart-defaults/` (regenerated Helm defaults for ArkCase charts)
+- `values/` (runtime overrides used for deploy/redeploy)
+- `README-yml-files.md` (full YAML workflow and regeneration instructions)
 
-`dev-values.yaml` is the active override file for local development.
+`values/dev-values.yaml` is the active override file for local development.
 
-`default-values.yaml` in this repo is based on chart defaults and can be regenerated at any time from Helm.
+`chart-defaults/` is based on chart defaults and can be regenerated at any time from Helm.
+
+For the full defaults/overrides workflow, see: `README-yml-files.md`.
 
 ---
 
-## 1.1) How to generate `default-values.yaml` yourself
+## 1.1) How to regenerate chart defaults yourself
 
 After adding/updating the chart repo:
 
 ```bash
 helm repo add arkcase https://arkcase.github.io/ark_helm_charts
 helm repo update
-helm show values arkcase/app > default-values.yaml
+helm show values arkcase/app > chart-defaults/app-values.yaml
 ```
 
 Optional (PowerShell, explicit UTF-8 write):
 
 ```powershell
-helm show values arkcase/app | Out-File -FilePath .\default-values.yaml -Encoding utf8
+helm show values arkcase/app | Out-File -FilePath .\chart-defaults\app-values.yaml -Encoding utf8
 ```
 
-This gives you the raw chart defaults; keep your local overrides in `dev-values.yaml`.
+This gives you raw chart defaults; keep your local runtime overrides in `values/dev-values.yaml`.
 
 ---
 
@@ -51,7 +54,7 @@ This gives you the raw chart defaults; keep your local overrides in `dev-values.
 If you want the least-stress, reproducible flow, use this sequence:
 
 1. Install platform prerequisites (Windows or Linux track below).
-2. Add Helm repo and generate `default-values.yaml`.
+2. Add Helm repo and (re)generate chart defaults under `chart-defaults/`.
 3. Create namespace `arkcase`.
 4. Install ingress-nginx (if missing).
 5. Install ArkCase into `arkcase` namespace.
@@ -215,7 +218,7 @@ kubectl get pods -n ingress-nginx
 
 ## 5) ArkCase values used by this repo
 
-`dev-values.yaml` currently includes these important overrides:
+`values/dev-values.yaml` currently includes these important overrides:
 
 - Base URL for ingress routing:
   - `global.settings.baseUrl: "https://server.dev.arkcase.com/arkcase"`
@@ -233,7 +236,7 @@ These are required for this chart/cluster pattern because ArkCase backend servic
 From repo root:
 
 ```bash
-helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f dev-values.yaml
+helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f values/dev-values.yaml
 ```
 
 Track rollout:
@@ -477,7 +480,7 @@ kubectl get pvc -n default
 1. Reinstall:
 
 ```bash
-helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f dev-values.yaml
+helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f values/dev-values.yaml
 ```
 
 2. Wait for readiness:
@@ -586,14 +589,14 @@ Fix:
 # 1) Tooling + chart defaults
 helm repo add arkcase https://arkcase.github.io/ark_helm_charts
 helm repo update
-helm show values arkcase/app > default-values.yaml
+helm show values arkcase/app > chart-defaults/app-values.yaml
 
 # 2) Ingress + namespace
 helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx --namespace default
 kubectl create namespace arkcase --dry-run=client -o yaml | kubectl apply -f -
 
 # 3) Deploy ArkCase
-helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f dev-values.yaml
+helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f values/dev-values.yaml
 
 # 4) Read generated admin credentials
 kubectl get secret arkcase-core-main-admin -n arkcase -o jsonpath='{.data.username}' | base64 -d; echo
@@ -615,7 +618,7 @@ helm uninstall arkcase -n arkcase
 helm uninstall arkcase -n default
 
 # Install in arkcase namespace
-helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f dev-values.yaml
+helm upgrade --install arkcase arkcase/app -n arkcase --create-namespace -f values/dev-values.yaml
 
 # Wait for pods
 kubectl get pods -n arkcase -w
@@ -630,6 +633,6 @@ kubectl get ingress arkcase-app -n arkcase -o wide
 
 If you want, the next step is to run this exact cycle now in your current cluster:
 1) uninstall `arkcase`,
-2) reinstall with `dev-values.yaml`,
+2) reinstall with `values/dev-values.yaml`,
 3) read generated admin credentials,
 4) verify login endpoint.
