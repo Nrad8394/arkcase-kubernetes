@@ -4,7 +4,7 @@ This guide gives you a **repeatable, low-stress** way to deploy ArkCase with thi
 
 It includes:
 - Windows setup (Docker Desktop + Kubernetes)
-- Linux setup (Podman + Minikube)
+- Linux setup (Podman as Minikube driver, or CRI-O + kubeadm for production)
 - Debian + RHEL 8 command examples
 - Helm + ingress setup
 - Admin credential discovery (with optional override)
@@ -115,14 +115,36 @@ sudo apt-get install -y podman
 
 ### RHEL 8 / Rocky 8 / Alma 8
 
+> **Important:** Kubernetes does not run directly on Podman. Podman does not expose a CRI socket,
+> which kubelet requires. On RHEL, the correct paths are:
+> - **Local dev:** use Minikube with the Podman driver (Minikube manages the control plane internally)
+> - **Production-like:** use CRI-O + kubeadm (see [Section 4.2](#42-option-b--production-like-kubernetes-with-cri-o))
+
+Install prerequisites:
+
 ```bash
 sudo dnf -y update
-sudo dnf -y install curl ca-certificates yum-utils
+sudo dnf -y install podman curl
+```
 
-# Podman (native on RHEL 8 family)
-sudo dnf -y install podman
+Install `kubectl`, `helm`, and `minikube` from official binaries:
 
-# kubectl / helm / minikube via official repos or binaries
+```bash
+# kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# helm (replace 3.17.3 with the current version from https://github.com/helm/helm/releases)
+curl -LO https://get.helm.sh/helm-v3.17.3-linux-amd64.tar.gz
+tar -zxvf helm-v3.17.3-linux-amd64.tar.gz
+mv linux-amd64/helm .
+rm -rf linux-amd64 helm-v3.17.3-linux-amd64.tar.gz
+
+# minikube
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+mv minikube-linux-amd64 minikube
+
+chmod +x kubectl minikube helm
+sudo mv kubectl minikube helm /usr/local/bin/
 ```
 
 Verify tools after install:
@@ -137,6 +159,10 @@ minikube version
 ## 2.2) Linux runtime gotchas (Debian + RHEL 8)
 
 ### RHEL 8 family
+
+> **Podman is not a Kubernetes container runtime.** Podman does not expose the CRI socket
+> that kubelet requires. Use Podman only as the Minikube driver (local dev) or for building
+> images. For a real cluster, install CRI-O as the container runtime (see [Section 4.2](#42-option-b--production-like-kubernetes-with-cri-o)).
 
 - If `firewalld` is enabled, ensure local Kubernetes networking is permitted.
 - If SELinux policy blocks containers/networking during local testing, check audit logs before changing policy.
@@ -187,11 +213,21 @@ kubectl get pods -l app.kubernetes.io/name=ingress-nginx
 
 ## 4) Path B — Linux (Podman + Minikube)
 
-> We use **Minikube with Podman driver** for reliable local Kubernetes on Podman.
+> **How it works:** Kubernetes does not run directly on Podman. Podman does not provide the CRI
+> socket that kubelet requires. Minikube solves this by managing the Kubernetes control plane
+> inside a Podman-managed container/VM and wiring up a compatible CRI internally.
+> **Podman is the driver for Minikube, not the Kubernetes runtime itself.**
 
-## 4.1 Install Podman + Minikube + kubectl + Helm
+There are two sub-paths depending on your use case:
 
-Install from your distro package manager (or official binaries) and confirm:
+| Goal | Recommended approach |
+|------|----------------------|
+| Local development | [Option A — Minikube with Podman driver](#41-option-a--local-dev-minikube-with-podman-driver) |
+| Production-like cluster | [Option B — CRI-O + kubeadm](#42-option-b--production-like-kubernetes-with-cri-o) |
+
+## 4.1 Option A — Local dev: Minikube with Podman driver
+
+Install Podman, kubectl, helm, and minikube (see [Section 2.1](#21-linux-package-examples-debian-and-rhel-8)) and confirm:
 
 ```bash
 podman --version
@@ -200,19 +236,49 @@ kubectl version --client
 helm version
 ```
 
-## 4.2 Start Kubernetes with Podman driver
+Start Kubernetes with the Podman driver:
 
 ```bash
 minikube start --driver=podman --cpus=6 --memory=12288
 kubectl get nodes
 ```
 
-## 4.3 Enable ingress addon
+Enable ingress addon:
 
 ```bash
 minikube addons enable ingress
 kubectl get pods -n ingress-nginx
 ```
+
+## 4.2 Option B — Production-like Kubernetes with CRI-O
+
+If you need a real multi-node Kubernetes cluster on RHEL (not Minikube), use CRI-O as the
+container runtime with `kubeadm` or `k3s`. Podman alone is **not sufficient** because it does
+not expose the CRI socket that kubelet expects.
+
+High-level steps:
+
+```bash
+# 1. Install CRI-O (check https://cri-o.io for current repo setup)
+sudo dnf -y install cri-o
+sudo systemctl enable --now crio
+
+# 2. Install kubeadm, kubelet, kubectl from the Kubernetes repo
+# See https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/
+
+# 3. Initialize the cluster
+sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+
+# 4. Configure kubectl
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+kubectl get nodes
+```
+
+> **Note:** For ingress on a bare-metal/kubeadm cluster, install ingress-nginx via Helm
+> instead of using `minikube addons enable ingress`.
 
 ---
 
