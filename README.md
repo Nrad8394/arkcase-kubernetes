@@ -1,7 +1,9 @@
 # ArkCase on Kubernetes — Complete RHEL Guide
 
-> **Who this is for:** Anyone deploying ArkCase via Helm on RHEL 8/9, Rocky Linux, or AlmaLinux.  
-> **What's fixed vs the original README:** Every RHEL-specific gotcha is called out, commands are verified working, and the original's incorrect assumptions about Podman/Kubernetes are corrected.
+> **Who this is for:** Anyone deploying ArkCase via Helm on RHEL 8/9, Rocky Linux, or AlmaLinux.
+> **What's fixed vs the original README:** The original had incorrect Podman/Kubernetes assumptions,
+> no RHEL system prerequisites, a broken Helm install command, and no guidance on what ArkCase
+> actually tests against. All of that is corrected here.
 
 ---
 
@@ -10,37 +12,58 @@
 1. [Before You Start — Read This](#1-before-you-start--read-this)
 2. [System Requirements](#2-system-requirements)
 3. [Choose Your Path](#3-choose-your-path)
-4. [Path A — Minikube (Local Dev/Testing)](#4-path-a--minikube-local-devtesting)
-5. [Path B — kubeadm Production Cluster](#5-path-b--kubeadm-production-cluster)
-6. [Install CLI Tools (kubectl + Helm)](#6-install-cli-tools-kubectl--helm)
-7. [Add the ArkCase Helm Repo](#7-add-the-arkcase-helm-repo)
-8. [Deploy ArkCase](#8-deploy-arkcase)
-9. [Read Admin Credentials](#9-read-admin-credentials)
-10. [Access the App](#10-access-the-app)
-11. [Troubleshooting](#11-troubleshooting)
-12. [Clean Uninstall & Reinstall](#12-clean-uninstall--reinstall)
-13. [Quick Reference Cheatsheet](#13-quick-reference-cheatsheet)
+4. [Path A — K3s ⭐ Recommended](#4-path-a--k3s--recommended)
+5. [Path B — Minikube (Single Machine, More Complex)](#5-path-b--minikube-single-machine-more-complex)
+6. [Path C — kubeadm (Production Multi-Node)](#6-path-c--kubeadm-production-multi-node)
+7. [Install Helm](#7-install-helm)
+8. [Add the ArkCase Helm Repo](#8-add-the-arkcase-helm-repo)
+9. [Deploy ArkCase](#9-deploy-arkcase)
+10. [Read Admin Credentials](#10-read-admin-credentials)
+11. [Access the App](#11-access-the-app)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Clean Uninstall & Reinstall](#13-clean-uninstall--reinstall)
+14. [Quick Reference Cheatsheet](#14-quick-reference-cheatsheet)
+15. [Appendix: values/dev-values.yaml](#15-appendix-valuesdev-valuesyaml)
 
 ---
 
 ## 1. Before You Start — Read This
 
-### Critical Misconception in the Original README
+### What ArkCase Actually Tests Against
 
-The original README says to use **Podman as a Kubernetes runtime**. This is wrong and will not work.
+ArkCase's official Helm charts are tested against **vanilla Kubernetes**, **Rancher Desktop**,
+and **EKS**. Minikube, K3s, and OpenShift are listed as "should work" — but are not officially
+validated. This matters because every problem you hit with an untested stack is yours to debug,
+not a documented issue with a known fix.
 
-Here is why:
+**K3s is the closest you can get to "vanilla Kubernetes" on a single RHEL machine**, which is
+why it is the recommended path in this guide.
 
-- **Podman** is a container management tool. It does not expose the CRI (Container Runtime Interface) socket that Kubernetes (`kubelet`) requires.
-- **Minikube with the Podman driver** works for local development because Minikube runs Kubernetes *inside* a Podman-managed container — Podman is the *driver*, not the runtime.
-- **For a real cluster** (multi-node, production-like), you need CRI-O or containerd as the actual runtime, managed by `kubeadm`.
+### The Podman Misconception (Original README Was Wrong)
+
+The original README implied you could use Podman as a Kubernetes runtime. **This does not work.**
+
+- **Podman** is a container tool. It has no CRI (Container Runtime Interface) socket, which
+  is what Kubernetes (`kubelet`) requires to manage containers.
+- **Minikube with the Podman driver** is different — Minikube runs Kubernetes *inside* a
+  Podman-managed container. Podman is the *VM driver*, not the runtime. The actual runtime
+  inside Minikube is containerd or CRI-O.
+- On RHEL 9 with rootless Podman, Minikube hits additional bugs: broken DNS, `/run/runc`
+  access errors, and stale volume state after crashes. These are real, documented issues — not
+  user error.
 
 ### Quick Decision Tree
 
 ```
-Are you just testing ArkCase on a single machine?
-  └─ YES → Use Path A (Minikube). Simplest setup, no production use.
-  └─ NO  → Use Path B (kubeadm + CRI-O). Proper cluster, supports multi-node.
+What is your goal?
+  ├─ Test/develop ArkCase on one machine (RHEL 8/9)
+  │    └─ Use Path A: K3s ← Start here. Two commands to a working cluster.
+  │
+  ├─ Already have Minikube set up and want to continue
+  │    └─ Use Path B: Minikube ← Read the caveats carefully.
+  │
+  └─ Production or multi-node cluster
+       └─ Use Path C: kubeadm + CRI-O
 ```
 
 ---
@@ -49,174 +72,62 @@ Are you just testing ArkCase on a single machine?
 
 ### Minimum Hardware
 
-| Component | Dev (Minikube) | Production (kubeadm) |
-|-----------|---------------|----------------------|
-| CPU cores | 6 | 4 per node (8+ recommended) |
-| RAM | 12 GB | 16 GB per node |
-| Disk | 50 GB free | 100 GB per node |
-| OS | RHEL 8/9, Rocky 8/9, AlmaLinux 8/9 | Same |
+| Component    | K3s / Minikube (single node)       | kubeadm (per node)      |
+|--------------|------------------------------------|-------------------------|
+| CPU cores    | 6                                  | 4 (8+ recommended)      |
+| RAM          | 12 GB                              | 16 GB                   |
+| Disk         | 50 GB free                         | 100 GB                  |
+| OS           | RHEL 8/9, Rocky 8/9, AlmaLinux 8/9 | Same                    |
 
-> **Why so much RAM?** ArkCase is a full enterprise stack: it includes a database, Solr search, Alfresco content management, Pentaho reporting, and the core application. Each component has its own pod. Under-resourcing is the #1 cause of pods stuck in `Pending`.
+> **Why so much RAM?** ArkCase is a full enterprise stack. Every component runs as its own pod:
+> the core app, PostgreSQL/MariaDB, Solr search, Alfresco content, ActiveMQ messaging, Samba LDAP,
+> and Pentaho reporting. Under-resourcing is the single most common cause of pods stuck in `Pending`.
 
 ### Software Prerequisites
 
 - RHEL 8, RHEL 9, Rocky Linux 8/9, or AlmaLinux 8/9
-- A user with `sudo` privileges (or root)
-- Internet access (or a pre-seeded private registry)
+- A user with `sudo` privileges
+- Internet access (or a private registry with ArkCase images pre-seeded)
 
 ---
 
 ## 3. Choose Your Path
 
-| Goal | Use |
-|------|-----|
-| Local development / testing on one machine | [Path A — Minikube](#4-path-a--minikube-local-devtesting) |
-| Production or multi-node cluster | [Path B — kubeadm](#5-path-b--kubeadm-production-cluster) |
+| Path | Best for | Runtime | Complexity |
+|------|----------|---------|------------|
+| **A — K3s** ⭐ | Dev/test on one RHEL machine | containerd (built in) | Low |
+| **B — Minikube** | If you specifically need Minikube | containerd / CRI-O inside VM | Medium–High on RHEL 9 |
+| **C — kubeadm** | Real multi-node cluster | CRI-O | High |
 
-Both paths converge at [Section 6](#6-install-cli-tools-kubectl--helm) for `kubectl` and `helm`.
-
----
-
-## 4. Path A — Minikube (Local Dev/Testing)
-
-Minikube creates a single-node Kubernetes cluster on your machine. On RHEL, the recommended driver is Podman (rootful mode) with CRI-O as the internal container runtime.
-
-> **Known issue with rootless Podman + Minikube:** DNS resolution inside the cluster often breaks when using rootless Podman. Always run Minikube as a regular user with `sudo`-capable Podman (rootful mode). If you must use rootless, you will likely hit CoreDNS timeouts and ingress failures.
-
-### Step 4.1 — Install Podman
-
-```bash
-sudo dnf -y update
-sudo dnf -y install podman
-```
-
-Verify:
-
-```bash
-podman --version
-# Expected: podman version 4.x.x
-```
-
-### Step 4.2 — Configure Podman for Rootful Minikube
-
-Minikube needs to call Podman with `sudo`. Set up passwordless sudo for Podman:
-
-```bash
-# Check your username
-whoami
-
-# Edit sudoers safely
-sudo visudo
-```
-
-Add this line at the bottom (replace `yourusername` with your actual username):
-
-```
-yourusername ALL=(ALL) NOPASSWD: /usr/bin/podman
-```
-
-Save and exit (`Esc`, then `:wq` in vi).
-
-### Step 4.3 — Install Minikube
-
-```bash
-curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
-sudo install minikube-linux-amd64 /usr/local/bin/minikube
-rm minikube-linux-amd64
-```
-
-Verify:
-
-```bash
-minikube version
-```
-
-### Step 4.4 — Install kubectl and Helm
-
-Jump to [Section 6](#6-install-cli-tools-kubectl--helm) and come back here.
-
-### Step 4.5 — Start Minikube
-
-```bash
-minikube start \
-  --driver=podman \
-  --container-runtime=cri-o \
-  --cpus=6 \
-  --memory=12288
-```
-
-If the above fails with a `cri-o` error (CRI-O not found inside Minikube), try without specifying the runtime — Minikube will pick a bundled one:
-
-```bash
-minikube start \
-  --driver=podman \
-  --cpus=6 \
-  --memory=12288
-```
-
-Check the cluster is up:
-
-```bash
-kubectl get nodes
-# Expected:
-# NAME       STATUS   ROLES           AGE   VERSION
-# minikube   Ready    control-plane   1m    v1.x.x
-```
-
-### Step 4.6 — Enable Ingress Addon
-
-```bash
-minikube addons enable ingress
-
-# Wait for the ingress pod to become ready
-kubectl get pods -n ingress-nginx -w
-# Press Ctrl+C when all pods show Running/Ready
-```
-
-> **Do not use** `helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx` alongside a Minikube ingress addon. The original README mixes both approaches, which causes conflicts. Use the addon for Minikube and skip the Helm-based ingress install.
-
-Now skip to [Section 7](#7-add-the-arkcase-helm-repo).
+All paths converge at [Section 7 — Install Helm](#7-install-helm).
 
 ---
 
-## 5. Path B — kubeadm Production Cluster
+## 4. Path A — K3s ⭐ Recommended
 
-This sets up a proper Kubernetes cluster using CRI-O as the container runtime and `kubeadm` to bootstrap. Run these steps on **every node** (control plane and workers) unless noted otherwise.
+K3s is a lightweight, fully conformant Kubernetes distribution packaged as a single binary.
+It bundles containerd as its runtime, requires zero driver configuration, and works cleanly
+on RHEL 8/9 out of the box. It is the lowest-friction path to a working ArkCase cluster on
+a single machine.
 
-### Step 5.1 — System Prep (All Nodes)
+### Step 4.1 — System Prep
 
-#### a) Update the system
+#### Disable swap
 
-```bash
-sudo dnf -y update
-sudo dnf -y install curl wget tar
-```
-
-#### b) Disable swap
-
-Kubernetes requires swap to be off. This is permanent:
+Kubernetes requires swap to be disabled:
 
 ```bash
-# Turn off swap immediately
 sudo swapoff -a
-
-# Comment out the swap line in fstab to survive reboots
 sudo sed -i '/\bswap\b/s/^/#/' /etc/fstab
 
-# Verify
+# Verify (should return nothing)
 swapon --show
-# (should show nothing)
 ```
 
-#### c) Set SELinux to Permissive
-
-SELinux in enforcing mode blocks several container networking operations. The official Kubernetes docs require it to be set to permissive. This is a runtime change + a permanent config change:
+#### Set SELinux to Permissive
 
 ```bash
-# Immediately (no reboot needed)
 sudo setenforce 0
-
-# Permanently
 sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
 
 # Verify
@@ -224,23 +135,22 @@ getenforce
 # Expected: Permissive
 ```
 
-> **Security note:** Setting SELinux to permissive does not disable audit logging — violations are still recorded. This is the same approach used by OpenShift. If your security policy forbids permissive mode, you will need to write custom SELinux policies for Kubernetes, which is out of scope here.
+> SELinux permissive mode still logs violations — it just does not block them. This is the
+> same approach used by OpenShift and is required for Kubernetes networking to function on RHEL.
 
-#### d) Load required kernel modules
+#### Load kernel modules
 
 ```bash
-# Load modules now
 sudo modprobe overlay
 sudo modprobe br_netfilter
 
-# Make them load automatically on boot
 cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
 overlay
 br_netfilter
 EOF
 ```
 
-#### e) Configure kernel networking parameters
+#### Set kernel networking parameters
 
 ```bash
 cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
@@ -249,67 +159,253 @@ net.bridge.bridge-nf-call-ip6tables = 1
 net.ipv4.ip_forward                 = 1
 EOF
 
-# Apply immediately
 sudo sysctl --system
 ```
 
-#### f) Configure firewall
-
-If `firewalld` is running, open the required ports. On a **control plane node**:
+#### Open firewall ports
 
 ```bash
-sudo firewall-cmd --permanent --add-port=6443/tcp       # Kubernetes API server
-sudo firewall-cmd --permanent --add-port=2379-2380/tcp  # etcd
-sudo firewall-cmd --permanent --add-port=10250/tcp      # kubelet API
-sudo firewall-cmd --permanent --add-port=10251/tcp      # kube-scheduler
-sudo firewall-cmd --permanent --add-port=10252/tcp      # kube-controller-manager
+sudo firewall-cmd --permanent --add-port=6443/tcp    # K3s API server
+sudo firewall-cmd --permanent --add-port=10250/tcp   # kubelet
+sudo firewall-cmd --permanent --add-port=443/tcp     # HTTPS ingress
+sudo firewall-cmd --permanent --add-port=80/tcp      # HTTP ingress
 sudo firewall-cmd --reload
 ```
 
-On **worker nodes**:
+### Step 4.2 — Install K3s
 
 ```bash
-sudo firewall-cmd --permanent --add-port=10250/tcp      # kubelet API
-sudo firewall-cmd --permanent --add-port=30000-32767/tcp # NodePort services
+curl -sfL https://get.k3s.io | sh -s - --disable traefik
+```
+
+That is the entire install. K3s will download its binary, set up containerd, start the
+Kubernetes control plane, and create a systemd service that starts on boot. The
+`--disable traefik` flag skips K3s's default ingress so we can install nginx ingress instead
+(which matches ArkCase's chart defaults).
+
+Wait a few seconds, then verify:
+
+```bash
+sudo k3s kubectl get nodes
+# Expected:
+# NAME        STATUS   ROLES                  AGE   VERSION
+# localhost   Ready    control-plane,master   30s   v1.x.x
+```
+
+### Step 4.3 — Configure kubectl Access
+
+```bash
+mkdir -p ~/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown $USER:$USER ~/.kube/config
+chmod 600 ~/.kube/config
+
+# Verify
+kubectl get nodes
+```
+
+### Step 4.4 — Install kubectl (Standalone Binary)
+
+K3s includes `kubectl` internally, but installing the standalone binary lets you use it
+without `sudo`:
+
+```bash
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm kubectl
+
+kubectl version --client
+```
+
+### Step 4.5 — Install ingress-nginx
+
+First install Helm (jump to [Section 7](#7-install-helm) and come back), then:
+
+```bash
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --create-namespace \
+  --set controller.service.type=NodePort \
+  --set controller.service.nodePorts.https=32443
+
+# Wait for the ingress controller pod to become ready
+kubectl get pods -n ingress-nginx -w
+# Ctrl+C when STATUS shows Running
+```
+
+Now continue to [Section 8 — Add the ArkCase Helm Repo](#8-add-the-arkcase-helm-repo).
+
+---
+
+## 5. Path B — Minikube (Single Machine, More Complex)
+
+> ⚠️ **Read this before choosing Minikube on RHEL 9:**
+> Minikube on RHEL 9 with Podman has several documented issues — rootless DNS failures,
+> `/run/runc` permission errors, stale volume state after crashes. If you hit these,
+> the fix is usually to delete everything and restart. K3s (Path A) avoids all of these.
+> Choose Minikube only if you have a specific reason to.
+
+### Step 5.1 — System Prep
+
+Same as K3s — disable swap, set SELinux permissive, load kernel modules, set sysctl params.
+Run the commands in [Step 4.1](#step-41--system-prep) first.
+
+### Step 5.2 — Install Podman and runc
+
+```bash
+sudo dnf -y update
+sudo dnf -y install podman runc
+
+podman --version
+runc --version
+```
+
+### Step 5.3 — Force Rootful Mode
+
+Rootless Podman breaks Minikube networking on RHEL 9. Unset it and force rootful:
+
+```bash
+# Remove any MINIKUBE_ROOTLESS setting from shell profiles
+grep -r MINIKUBE_ROOTLESS ~/.bashrc ~/.bash_profile ~/.profile 2>/dev/null
+# If found, remove those lines
+
+unset MINIKUBE_ROOTLESS
+
+# Set up passwordless sudo for Podman
+sudo visudo
+# Add this line at the bottom (replace yourusername with your actual username):
+# yourusername ALL=(ALL) NOPASSWD: /usr/bin/podman
+```
+
+### Step 5.4 — Install Minikube
+
+```bash
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+sudo install -o root -g root -m 0755 minikube-linux-amd64 /usr/local/bin/minikube
+rm minikube-linux-amd64
+
+minikube version
+```
+
+### Step 5.5 — Clean Any Broken State
+
+If you have a failed previous install:
+
+```bash
+minikube delete --all --purge
+podman volume rm minikube 2>/dev/null || true
+podman rm -f minikube 2>/dev/null || true
+podman network rm minikube 2>/dev/null || true
+minikube config unset rootless
+```
+
+### Step 5.6 — Start Minikube
+
+```bash
+minikube start \
+  --driver=podman \
+  --rootless=false \
+  --cpus=6 \
+  --memory=12288
+
+kubectl get nodes
+```
+
+### Step 5.7 — Enable Ingress
+
+```bash
+minikube addons enable ingress
+
+kubectl get pods -n ingress-nginx -w
+# Ctrl+C when all pods show Running
+```
+
+> **Do not** also install ingress-nginx via Helm alongside the Minikube addon. The original
+> README mixes both and causes conflicts. Use the addon only.
+
+Now continue to [Section 7 — Install Helm](#7-install-helm).
+
+---
+
+## 6. Path C — kubeadm (Production Multi-Node)
+
+Run all steps on **every node** unless marked "control plane only".
+
+### Step 6.1 — System Prep (All Nodes)
+
+```bash
+sudo dnf -y update
+sudo dnf -y install curl wget tar
+
+# Disable swap
+sudo swapoff -a
+sudo sed -i '/\bswap\b/s/^/#/' /etc/fstab
+
+# SELinux permissive
+sudo setenforce 0
+sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+
+# Kernel modules
+sudo modprobe overlay
+sudo modprobe br_netfilter
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+# Sysctl
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+sudo sysctl --system
+```
+
+#### Firewall — Control Plane
+
+```bash
+sudo firewall-cmd --permanent --add-port=6443/tcp
+sudo firewall-cmd --permanent --add-port=2379-2380/tcp
+sudo firewall-cmd --permanent --add-port=10250-10252/tcp
 sudo firewall-cmd --reload
 ```
 
-### Step 5.2 — Install CRI-O
-
-CRI-O is Red Hat's preferred container runtime for Kubernetes on RHEL. Set the version variable to match the Kubernetes version you plan to install:
+#### Firewall — Worker Nodes
 
 ```bash
-# Set this to match your intended Kubernetes version
+sudo firewall-cmd --permanent --add-port=10250/tcp
+sudo firewall-cmd --permanent --add-port=30000-32767/tcp
+sudo firewall-cmd --reload
+```
+
+### Step 6.2 — Install CRI-O (All Nodes)
+
+```bash
 KUBERNETES_VERSION=v1.30
-CRIO_VERSION=v1.30
 
-# Add CRI-O repository
 cat <<EOF | sudo tee /etc/yum.repos.d/cri-o.repo
 [cri-o]
 name=CRI-O
-baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/$CRIO_VERSION/rpm/
+baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/$KUBERNETES_VERSION/rpm/
 enabled=1
 gpgcheck=1
-gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/$CRIO_VERSION/rpm/repodata/repomd.xml.key
+gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/$KUBERNETES_VERSION/rpm/repodata/repomd.xml.key
 EOF
 
-# Install CRI-O
 sudo dnf -y install cri-o
-
-# Enable and start CRI-O
 sudo systemctl enable --now crio
-
-# Verify CRI-O is running
 sudo systemctl status crio
 ```
 
-### Step 5.3 — Install Kubernetes Components
+### Step 6.3 — Install Kubernetes Components (All Nodes)
 
 ```bash
-# Set Kubernetes version (match CRIO_VERSION above)
 KUBERNETES_VERSION=v1.30
 
-# Add Kubernetes repository
 cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
 [kubernetes]
 name=Kubernetes
@@ -320,52 +416,40 @@ gpgkey=https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/rpm/repodata/repomd
 exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
 EOF
 
-# Install Kubernetes components
 sudo dnf makecache
 sudo dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
-
-# Enable kubelet (it won't start fully until after kubeadm init, that is normal)
 sudo systemctl enable --now kubelet
 ```
 
-### Step 5.4 — Initialize the Cluster (Control Plane Node Only)
-
-Run this only on the control plane (master) node:
+### Step 6.4 — Initialize the Cluster (Control Plane Only)
 
 ```bash
 sudo kubeadm init --pod-network-cidr=10.244.0.0/16
-
-# This will print a `kubeadm join` command at the end. 
-# COPY IT — you'll need it for worker nodes.
 ```
 
-Set up `kubectl` access for your regular user:
+> ⚠️ The output prints a `kubeadm join` command. **Copy it now.** You need it for Step 6.6.
 
 ```bash
 mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 
-# Verify
 kubectl get nodes
-# Control plane will show NotReady — that is normal until CNI is installed
+# Shows NotReady — normal until CNI is installed next
 ```
 
-### Step 5.5 — Install a CNI Network Plugin (Control Plane Only)
-
-Kubernetes needs a pod network. Calico is a reliable choice for RHEL:
+### Step 6.5 — Install CNI (Control Plane Only)
 
 ```bash
 kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
 
-# Wait for nodes to become Ready (may take 1-2 minutes)
 kubectl get nodes -w
-# Press Ctrl+C when status shows Ready
+# Ctrl+C when all nodes show Ready
 ```
 
-### Step 5.6 — Join Worker Nodes (Worker Nodes Only)
+### Step 6.6 — Join Worker Nodes (Workers Only)
 
-On each worker node, run the `kubeadm join` command that was printed during `kubeadm init`. It looks like this:
+Run the `kubeadm join` command printed in Step 6.4:
 
 ```bash
 sudo kubeadm join <CONTROL_PLANE_IP>:6443 \
@@ -373,16 +457,13 @@ sudo kubeadm join <CONTROL_PLANE_IP>:6443 \
   --discovery-token-ca-cert-hash sha256:<HASH>
 ```
 
-Back on the control plane, verify all nodes joined:
+Verify from control plane:
 
 ```bash
 kubectl get nodes
-# All nodes should eventually show Ready
 ```
 
-### Step 5.7 — Install Ingress Controller (Control Plane Only)
-
-For a kubeadm cluster, install ingress-nginx via Helm (not Minikube addon):
+### Step 6.7 — Install Ingress Controller (Control Plane Only)
 
 ```bash
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
@@ -392,128 +473,80 @@ helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
   --namespace ingress-nginx \
   --create-namespace
 
-# Wait for ingress controller pod
 kubectl get pods -n ingress-nginx -w
 ```
 
 ---
 
-## 6. Install CLI Tools (kubectl + Helm)
+## 7. Install Helm
 
-> Skip kubectl if you already installed it in Section 5.3. Run these steps on the machine where you will run `helm` and `kubectl` commands (typically the control plane or your workstation).
-
-### Install kubectl
-
-#### Option A — Via Kubernetes yum repo (recommended for RHEL)
+> Run on the machine where you execute `helm` and `kubectl` (same machine for K3s/Minikube,
+> control plane for kubeadm).
 
 ```bash
-KUBERNETES_VERSION=v1.30
-
-cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
-[kubernetes]
-name=Kubernetes
-baseurl=https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/rpm/
-enabled=1
-gpgcheck=1
-gpgkey=https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/rpm/repodata/repomd.xml.key
-EOF
-
-sudo dnf install -y kubectl
-```
-
-#### Option B — Binary download
-
-```bash
-curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
-rm kubectl
-```
-
-Verify:
-
-```bash
-kubectl version --client
-```
-
----
-
-### Install Helm
-
-The original README's Helm install has a common RHEL bug: `chmod +x helm /usr/local/bin/` changes permissions on the *directory*, not the binary. The correct sequence is:
-
-```bash
-# Download the latest Helm release
 HELM_VERSION=v3.17.3
 curl -LO "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
-
-# Extract
 tar -zxvf "helm-${HELM_VERSION}-linux-amd64.tar.gz"
 
-# Install the binary (correct way)
+# NOTE: install sets permissions on the binary itself, not the directory
 sudo install -o root -g root -m 0755 linux-amd64/helm /usr/local/bin/helm
 
-# Clean up
 rm -rf linux-amd64 "helm-${HELM_VERSION}-linux-amd64.tar.gz"
 ```
-
-> **If you get `bash: helm: command not found` after installation**, your PATH may not include `/usr/local/bin`. Fix it:
-> ```bash
-> echo 'export PATH=$PATH:/usr/local/bin' >> ~/.bashrc
-> source ~/.bashrc
-> ```
 
 Verify:
 
 ```bash
 helm version
-# Expected: version.BuildInfo{Version:"v3.17.3", ...}
 ```
+
+> **`helm: command not found` after install?** Fix PATH:
+> ```bash
+> echo 'export PATH=$PATH:/usr/local/bin' >> ~/.bashrc
+> source ~/.bashrc
+> ```
 
 ---
 
-## 7. Add the ArkCase Helm Repo
-
-Run these on any machine with `helm` and `kubectl` configured to talk to your cluster:
+## 8. Add the ArkCase Helm Repo
 
 ```bash
 helm repo add arkcase https://arkcase.github.io/ark_helm_charts
 helm repo update
 
-# Verify the chart is available
+# Verify
 helm search repo arkcase/app
 ```
 
-You should see output similar to:
+Expected output:
 
 ```
 NAME           CHART VERSION   APP VERSION   DESCRIPTION
 arkcase/app    x.x.x           x.x.x         ArkCase Application
 ```
 
-If the search returns nothing, your Helm repo cache may be stale — run `helm repo update` again.
+If the search returns nothing, run `helm repo update` again and retry.
 
-### Optional: Generate chart defaults for reference
+### Optional: Save chart defaults for reference
 
 ```bash
 mkdir -p chart-defaults
 helm show values arkcase/app > chart-defaults/app-values.yaml
 ```
 
-This is useful to see every configurable option before deploying.
-
 ---
 
-## 8. Deploy ArkCase
+## 9. Deploy ArkCase
 
-### Step 8.1 — Create the Namespace
+### Step 9.1 — Create the Namespace
 
 ```bash
 kubectl create namespace arkcase --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-The `--dry-run=client -o yaml | kubectl apply` pattern is idempotent — it is safe to run multiple times and will not error if the namespace already exists.
+This is idempotent — safe to run multiple times, will not error if the namespace already exists.
 
-### Step 8.2 — Install ArkCase
+### Step 9.2 — Install ArkCase
 
 From the root of this repository:
 
@@ -525,41 +558,43 @@ helm upgrade --install arkcase arkcase/app \
   --timeout 20m
 ```
 
-> **Why `--timeout 20m`?** The original README has no timeout. ArkCase pulls many images and initializes several services. The default Helm timeout (5 minutes) is often not enough, causing a misleading "timeout" failure even though the pods eventually come up. 20 minutes is a safe buffer.
+> **Why `--timeout 20m`?** The original README omits a timeout. ArkCase pulls many images on
+> first install, and the default 5-minute Helm timeout causes a misleading failure even though
+> pods eventually come up. 20 minutes is a safe buffer.
 
-### Step 8.3 — Watch Rollout
+### Step 9.3 — Watch the Rollout
 
 ```bash
 kubectl get pods -n arkcase -w
 ```
 
-Press `Ctrl+C` when all pods show `Running` and `1/1` in the READY column. This can take 10–20 minutes on the first install as images are pulled.
+Press `Ctrl+C` when all pods show `Running` and `1/1` in the READY column. First install
+typically takes 10–20 minutes.
 
-#### Pods stuck in `Pending`?
+### Pods stuck in Pending?
 
-This almost always means **insufficient resources**. Check:
+Almost always a resource issue:
 
 ```bash
 kubectl describe pod <stuck-pod-name> -n arkcase
-# Look for "Insufficient memory" or "Insufficient cpu" in the Events section
+# Look for "Insufficient memory" or "Insufficient cpu" in Events
 ```
 
-If you see resource errors, either increase your cluster resources or enable dev mode to reduce resource requests:
+Make sure `values/dev-values.yaml` has:
 
-```bash
-# In your values/dev-values.yaml, add or verify:
+```yaml
 global:
   dev:
-    resources: true   # This is the default — uses lower resource requests
+    resources: true   # Reduces resource requests for dev/test environments
 ```
 
 ---
 
-## 9. Read Admin Credentials
+## 10. Read Admin Credentials
 
 ArkCase auto-generates admin credentials and stores them in a Kubernetes Secret.
 
-### Read credentials (Bash)
+### Bash
 
 ```bash
 echo "Username:"
@@ -571,7 +606,7 @@ kubectl get secret arkcase-core-main-admin -n arkcase \
   -o jsonpath='{.data.password}' | base64 -d; echo
 ```
 
-### Read credentials (PowerShell — Windows)
+### PowerShell (Windows)
 
 ```powershell
 $u = kubectl get secret arkcase-core-main-admin -n arkcase -o jsonpath='{.data.username}'
@@ -582,17 +617,15 @@ $p = kubectl get secret arkcase-core-main-admin -n arkcase -o jsonpath='{.data.p
 
 ### Important: Login username format
 
-The username stored in the secret (e.g., `arkcase-admin`) must be entered with the domain suffix when logging in through the UI:
+The secret stores `arkcase-admin`. The UI requires the domain suffix:
 
 ```
 arkcase-admin@dev.arkcase.com
 ```
 
-Using just `arkcase-admin` will return a `?login_error` even with the correct password.
+Using `arkcase-admin` without the domain returns `?login_error` even with the correct password.
 
-### Optional: Set a custom admin password
-
-Only do this if you want to replace the auto-generated password:
+### Optional: Set a custom password
 
 ```bash
 kubectl patch secret arkcase-core-main-admin -n arkcase \
@@ -604,295 +637,251 @@ kubectl patch secret arkcase-core-main-admin -n arkcase \
     }
   }'
 
-# Restart the core pod to pick up the new secret
 kubectl rollout restart statefulset/arkcase-core -n arkcase
 kubectl rollout status statefulset/arkcase-core -n arkcase --timeout=300s
 ```
 
 ---
 
-## 10. Access the App
+## 11. Access the App
 
-ArkCase is configured to run at:
+ArkCase is configured to run at `https://server.dev.arkcase.com/arkcase`.
+Your machine needs to resolve that hostname to your ingress controller.
 
+### Step 11.1 — Find Your Ingress IP / Port
+
+**K3s with NodePort ingress:**
+
+```bash
+# Node IP
+kubectl get nodes -o wide
+# Use the INTERNAL-IP column
+
+# NodePort for HTTPS (will be 32443 if you followed Step 4.5)
+kubectl get svc ingress-nginx-controller -n ingress-nginx
 ```
-https://server.dev.arkcase.com/arkcase
-```
-
-Your machine needs to resolve this hostname to the ingress controller.
-
-### Step 10.1 — Find Your Ingress IP
 
 **Minikube:**
 
 ```bash
 minikube ip
-# Returns something like: 192.168.49.2
 ```
 
-**kubeadm:**
+**kubeadm (if EXTERNAL-IP shows `<pending>`):**
+
+Use port-forward — see Step 11.3.
+
+### Step 11.2 — Add a Hosts File Entry
+
+**Linux:**
 
 ```bash
-kubectl get svc -n ingress-nginx
-# Look for the EXTERNAL-IP of ingress-nginx-controller
-# On bare metal this may show <pending> — see note below
+# Replace 192.168.x.x with your actual ingress IP
+echo "192.168.x.x  server.dev.arkcase.com" | sudo tee -a /etc/hosts
 ```
 
-> **kubeadm bare-metal note:** If `EXTERNAL-IP` shows `<pending>`, your cluster has no LoadBalancer provisioner. Use port-forwarding instead (see Step 10.3).
-
-### Step 10.2 — Add a Hosts File Entry
-
-**Linux** (`/etc/hosts`):
-
-```bash
-# Replace 192.168.49.2 with your actual ingress IP
-echo "192.168.49.2  server.dev.arkcase.com" | sudo tee -a /etc/hosts
-```
-
-**Windows** (`C:\Windows\System32\drivers\etc\hosts`, run as Administrator):
+**Windows** (`C:\Windows\System32\drivers\etc\hosts`, open as Administrator):
 
 ```
-192.168.49.2  server.dev.arkcase.com
+192.168.x.x  server.dev.arkcase.com
 ```
 
-### Step 10.3 — Port-Forward (If Ingress IP Is Unreachable)
+### Step 11.3 — Port-Forward (Fallback)
 
-If you cannot route to the ingress IP directly (common on laptops, VMs without bridged networking):
+When the ingress IP is not routable from your machine:
 
 ```bash
 kubectl port-forward svc/ingress-nginx-controller 8444:443 -n ingress-nginx
 ```
 
-Then access ArkCase at:
-
-```
-https://server.dev.arkcase.com:8444/arkcase/
-```
-
-And add this to your hosts file instead:
+Update hosts file to:
 
 ```
 127.0.0.1  server.dev.arkcase.com
 ```
 
-### Step 10.4 — Verify the Endpoint
+Then access at `https://server.dev.arkcase.com:8444/arkcase/`
+
+### Step 11.4 — Verify the Endpoint
 
 ```bash
-# Should return HTTP 302 (redirect to login)
+# Expect HTTP 302 (redirect to login)
 curl -k -I --resolve server.dev.arkcase.com:443:127.0.0.1 \
   https://server.dev.arkcase.com/arkcase/
 
-# Should return HTTP 200
+# Expect HTTP 200
 curl -k -I --resolve server.dev.arkcase.com:443:127.0.0.1 \
   https://server.dev.arkcase.com/arkcase/login
 ```
 
-If using port-forward on 8444:
+### Step 11.5 — Log In
 
-```bash
-curl -k -I --resolve server.dev.arkcase.com:8444:127.0.0.1 \
-  https://server.dev.arkcase.com:8444/arkcase/login
-```
-
-### Step 10.5 — Log In
-
-Open a browser (use Incognito/Private mode to avoid cached session issues) and go to:
+Open a browser in Incognito/Private mode (avoids cached session issues):
 
 ```
 https://server.dev.arkcase.com/arkcase/
 ```
 
-Login with:
-- **Username:** `arkcase-admin@dev.arkcase.com` (the decoded username + `@dev.arkcase.com`)
-- **Password:** the decoded password from Section 9
+- **Username:** `arkcase-admin@dev.arkcase.com`
+- **Password:** decoded from the secret (Section 10)
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
-### Problem: `helm: command not found` after installation
-
-**Cause:** `/usr/local/bin` is not in PATH, or the binary was given execute permission on the directory instead of the file.
-
-**Fix:**
+### `helm: command not found`
 
 ```bash
-# Check if helm exists at the right path
 ls -la /usr/local/bin/helm
 
-# If it's there but not found, fix PATH
 echo 'export PATH=$PATH:/usr/local/bin' >> ~/.bashrc
 source ~/.bashrc
 ```
 
 ---
 
-### Problem: Pods stuck in `Pending`
-
-**Check:**
+### Pods stuck in `Pending`
 
 ```bash
 kubectl describe pod <pod-name> -n arkcase
-# Look at the Events section at the bottom
 ```
-
-**Common causes and fixes:**
 
 | Event message | Cause | Fix |
 |---|---|---|
-| `Insufficient memory` | Not enough RAM | Add memory to nodes or reduce resource requests |
-| `Insufficient cpu` | Not enough CPU | Add CPU to nodes |
-| `no nodes are available that match all of the following predicates` | Resource + taint combo | Remove control-plane taint: `kubectl taint nodes --all node-role.kubernetes.io/control-plane-` |
-| `PersistentVolumeClaim is not bound` | No storage provisioner | Ensure default StorageClass exists: `kubectl get storageclass` |
+| `Insufficient memory` | Not enough RAM | Increase node memory or set `global.dev.resources: true` |
+| `Insufficient cpu` | Not enough CPU | Increase node CPU |
+| `no nodes available that match all predicates` | Control plane taint | `kubectl taint nodes --all node-role.kubernetes.io/control-plane-` |
+| `PersistentVolumeClaim is not bound` | No storage provisioner | `kubectl get storageclass` — ensure a default exists |
 
 ---
 
-### Problem: Pods stuck in `ImagePullBackOff`
-
-**Check:**
+### Pods stuck in `ImagePullBackOff`
 
 ```bash
 kubectl describe pod <pod-name> -n arkcase
-# Look for "Failed to pull image" in Events
-```
-
-**Common cause:** Rate limiting on Docker Hub or network access issues.
-
-**Fix:**
-
-```bash
-# Test connectivity from a node
 curl -I https://registry-1.docker.io/
 ```
 
-If behind a corporate proxy, set `HTTP_PROXY` and `HTTPS_PROXY` for the container runtime. For CRI-O:
+If behind a corporate proxy, configure the K3s service:
 
 ```bash
-sudo mkdir -p /etc/systemd/system/crio.service.d/
-cat <<EOF | sudo tee /etc/systemd/system/crio.service.d/proxy.conf
+sudo mkdir -p /etc/systemd/system/k3s.service.d/
+cat <<EOF | sudo tee /etc/systemd/system/k3s.service.d/proxy.conf
 [Service]
 Environment="HTTP_PROXY=http://proxy.example.com:3128"
 Environment="HTTPS_PROXY=http://proxy.example.com:3128"
 Environment="NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,192.168.0.0/16"
 EOF
 sudo systemctl daemon-reload
-sudo systemctl restart crio
+sudo systemctl restart k3s
 ```
 
 ---
 
-### Problem: Login fails with correct credentials
+### Login fails with correct credentials
 
-**Cause A:** Domain suffix missing from username.
+**Domain suffix missing** — use `arkcase-admin@dev.arkcase.com`, not `arkcase-admin`.
 
-**Fix:** Use `arkcase-admin@dev.arkcase.com`, not `arkcase-admin`.
-
-**Cause B:** The `arkcase-core` pod cached the old credentials.
-
-**Fix:**
+**Pod cached old credentials** — restart core:
 
 ```bash
 kubectl rollout restart statefulset/arkcase-core -n arkcase
 kubectl rollout status statefulset/arkcase-core -n arkcase --timeout=300s
 ```
 
-Then try again in a fresh Incognito/Private browser window.
-
-**Cause C:** Browser has a cached session from a previous install.
-
-**Fix:** Clear cookies for `server.dev.arkcase.com`, or use a different browser/Incognito window.
+**Browser cached session** — use a fresh Incognito window or clear cookies for
+`server.dev.arkcase.com`.
 
 ---
 
-### Problem: `kubectl port-forward` fails — address already in use
-
-**Fix:**
+### `kubectl port-forward` fails — address already in use
 
 ```bash
-# Check what's using the port (Linux)
 sudo ss -tlnp | grep 8443
 
-# Kill that process, or use an alternate local port:
+# Use an alternate local port instead
 kubectl port-forward -n arkcase svc/core 9443:8443
 ```
 
 ---
 
-### Problem: `kubectl get pods -l app.kubernetes.io/name=arkcase` shows no results
+### `kubectl get pods -l app.kubernetes.io/name=arkcase` returns nothing
 
-**Cause:** ArkCase pods use a different label selector.
-
-**Fix:**
+ArkCase pods use `instance`, not `name`:
 
 ```bash
-# Correct label selectors for ArkCase
 kubectl get pods -n arkcase -l app.kubernetes.io/instance=arkcase
-
-# Or just list everything in the namespace
+# or simply
 kubectl get pods -n arkcase
 ```
 
 ---
 
-### Problem: Helm install fails with `another operation is in progress`
-
-**Cause:** A previous Helm operation was interrupted and left the release in a bad state.
-
-**Fix:**
+### Helm stuck in `pending-install` or `pending-upgrade`
 
 ```bash
-# Check the release status
 helm list -A
-
-# If status shows pending-install or pending-upgrade, force-delete the stuck release
 helm delete arkcase -n arkcase --no-hooks
-
-# Then reinstall
-helm upgrade --install arkcase arkcase/app -n arkcase -f values/dev-values.yaml
+helm upgrade --install arkcase arkcase/app -n arkcase -f values/dev-values.yaml --timeout 20m
 ```
 
 ---
 
-### Problem: CRI-O fails to start on RHEL 8
+### Minikube: volume already exists / container not found
 
-**Check:**
-
-```bash
-sudo journalctl -u crio -n 50
-```
-
-A common error is a missing or misconfigured runtime:
+Stale Minikube state. Clean everything:
 
 ```bash
-# Ensure conmon and runc/crun are installed
-sudo dnf install -y cri-o conmon runc
-sudo systemctl restart crio
+minikube delete --all --purge
+podman volume rm minikube 2>/dev/null || true
+podman rm -f minikube 2>/dev/null || true
+podman network rm minikube 2>/dev/null || true
+minikube config unset rootless
+unset MINIKUBE_ROOTLESS
+
+minikube start --driver=podman --rootless=false --cpus=6 --memory=12288
 ```
 
 ---
 
-## 12. Clean Uninstall & Reinstall
+### Minikube: `/run/runc: no such file or directory`
+
+Rootless Podman cannot access the runc socket:
+
+```bash
+# Ensure runc is installed
+sudo dnf install -y runc
+
+# Force rootful mode (more reliable)
+minikube delete
+minikube config unset rootless
+unset MINIKUBE_ROOTLESS
+minikube start --driver=podman --rootless=false --cpus=6 --memory=12288
+```
+
+---
+
+## 13. Clean Uninstall & Reinstall
 
 ### Uninstall ArkCase
 
 ```bash
 helm uninstall arkcase -n arkcase
 
-# Verify removal
 helm list -A
 kubectl get pods -n arkcase
 ```
 
-### (Optional) Delete persistent data
+### Delete Persistent Data (Optional — Destructive)
 
-> ⚠️ This is destructive and permanent. All ArkCase data will be lost.
+> ⚠️ This permanently deletes all ArkCase data including the database.
 
 ```bash
 kubectl get pvc -n arkcase
 kubectl delete pvc --all -n arkcase
 ```
 
-### Reinstall from scratch
+### Reinstall from Scratch
 
 ```bash
 helm upgrade --install arkcase arkcase/app \
@@ -901,13 +890,12 @@ helm upgrade --install arkcase arkcase/app \
   -f values/dev-values.yaml \
   --timeout 20m
 
-# Watch pods come up
 kubectl get pods -n arkcase -w
 ```
 
 ---
 
-## 13. Quick Reference Cheatsheet
+## 14. Quick Reference Cheatsheet
 
 ```bash
 # ── CLUSTER STATUS ────────────────────────────────────────────────
@@ -931,59 +919,69 @@ kubectl get secret arkcase-core-main-admin -n arkcase \
 kubectl get secret arkcase-core-main-admin -n arkcase \
   -o jsonpath='{.data.password}' | base64 -d; echo
 
-# ── ACCESS ────────────────────────────────────────────────────────
-# Minikube ingress IP
-minikube ip
-
-# Port-forward ingress (when IP not routable)
-kubectl port-forward svc/ingress-nginx-controller 8444:443 -n ingress-nginx
-
-# Port-forward directly to core
-kubectl port-forward svc/core 9443:8443 -n arkcase
+# ── K3s ───────────────────────────────────────────────────────────
+# Install (no Traefik)
+curl -sfL https://get.k3s.io | sh -s - --disable traefik
+# Kubeconfig
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config && sudo chown $USER:$USER ~/.kube/config
+# Status / logs
+sudo systemctl status k3s
+sudo journalctl -u k3s -n 50
 
 # ── INGRESS ───────────────────────────────────────────────────────
+kubectl get svc -n ingress-nginx
 kubectl get ingress -n arkcase
 kubectl describe ingress -n arkcase
+# Port-forward when IP not directly routable
+kubectl port-forward svc/ingress-nginx-controller 8444:443 -n ingress-nginx
 
 # ── DEBUGGING ─────────────────────────────────────────────────────
 kubectl describe pod <pod-name> -n arkcase
 kubectl logs <pod-name> -n arkcase
-kubectl logs <pod-name> -n arkcase --previous  # logs from last crash
-
-# Restart the core statefulset
+kubectl logs <pod-name> -n arkcase --previous
 kubectl rollout restart statefulset/arkcase-core -n arkcase
 kubectl rollout status statefulset/arkcase-core -n arkcase --timeout=300s
 
 # ── CLEANUP ───────────────────────────────────────────────────────
 kubectl get pvc -n arkcase
-kubectl delete pvc --all -n arkcase   # WARNING: destroys all data
+kubectl delete pvc --all -n arkcase   # ⚠️ destroys all data
+
+# ── MINIKUBE RESET (when broken) ──────────────────────────────────
+minikube delete --all --purge
+podman volume rm minikube
+podman rm -f minikube
+podman network rm minikube
+minikube config unset rootless
 ```
 
 ---
 
-## Appendix: values/dev-values.yaml Key Settings
+## 15. Appendix: values/dev-values.yaml
 
-The `values/dev-values.yaml` file in this repo overrides the chart defaults for local development. Key settings:
+The `values/dev-values.yaml` in this repo overrides chart defaults for local development.
+
+### Key settings
 
 ```yaml
 global:
   settings:
     baseUrl: "https://server.dev.arkcase.com/arkcase"
   ingress:
-    className: "nginx"
+    className: "nginx"      # Change to "traefik" only if keeping K3s default ingress
   dev:
-    resources: true   # Enables lower resource requests for dev
+    resources: true         # Reduces resource requests — essential for dev machines
 ```
 
-The ingress annotations ensure ArkCase's HTTPS backend is handled correctly:
+### Ingress backend annotations
+
+ArkCase's core service speaks HTTPS. These annotations tell nginx to proxy to it correctly:
 
 ```yaml
-# These annotations tell nginx to proxy to an HTTPS backend
 nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
 nginx.ingress.kubernetes.io/ssl-redirect: "true"
 ```
 
-To see all configurable values:
+### See all chart options
 
 ```bash
 helm show values arkcase/app | less
@@ -991,4 +989,6 @@ helm show values arkcase/app | less
 
 ---
 
-*Guide last updated: March 2026. Tested against RHEL 8/9, Rocky Linux 8/9, Minikube v1.33+, Kubernetes v1.30, Helm v3.17, ArkCase chart series 25.x.*
+*Guide last updated: March 2026. Covers RHEL 8/9, Rocky Linux 8/9, K3s v1.30+, Minikube v1.38+,
+Kubernetes v1.30, Helm v3.17, ArkCase chart series 25.x. ArkCase officially tests against
+vanilla Kubernetes, Rancher Desktop, and EKS. K3s is the recommended single-node path for RHEL.*
