@@ -634,11 +634,83 @@ kubectl get pods -n ingress-nginx -w
 Docker Desktop is the recommended path for Windows and macOS. It ships with a built-in
 single-node Kubernetes cluster backed by containerd — no VM driver configuration needed.
 
+### Step 8.0 — Enable WSL2 (Windows only, required prerequisite)
+
+Docker Desktop on Windows requires WSL2 (Windows Subsystem for Linux 2). Run these steps
+in **PowerShell as Administrator** before installing Docker Desktop.
+
+#### Enable Windows features
+
+```powershell
+# Enable the two required Windows features
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+```
+
+**Restart your machine**, then continue in a new Administrator PowerShell session.
+
+#### Set WSL2 as the default version
+
+```powershell
+wsl --set-default-version 2
+```
+
+#### Install a Linux distribution (Ubuntu recommended)
+
+```powershell
+# Install Ubuntu from the Microsoft Store via winget
+winget install Canonical.Ubuntu.2204
+```
+
+When the Ubuntu window opens for the first time, create a username and password when
+prompted. You can then close it — Docker Desktop uses WSL2 as a backend without
+requiring you to use the Linux shell directly.
+
+#### Verify WSL2 is running
+
+```powershell
+wsl --list --verbose
+# Expected (State should be Running or Stopped, Version should be 2):
+# NAME            STATE   VERSION
+# Ubuntu-22.04    Stopped 2
+```
+
+> **Windows 11 / Windows 10 21H2+:** WSL2 is already supported. Older Windows 10 builds
+> (before 21H2) require the [WSL2 Linux kernel update package](https://aka.ms/wsl2kernel)
+> after the feature enable step above.
+
 ### Step 8.1 — Install Docker Desktop
 
-Download from: `https://www.docker.com/products/docker-desktop/`
+1. Download the installer from: `https://www.docker.com/products/docker-desktop/`
+   (choose **Windows — AMD64** unless you are on an ARM device)
 
-### Step 8.2 — Enable Kubernetes
+2. Run **Docker Desktop Installer.exe**
+
+3. On the configuration page, ensure **Use WSL 2 instead of Hyper-V** is checked
+
+4. Click **OK** and let the installer finish
+
+5. **Restart your machine** when prompted (or click *Close and restart*)
+
+6. After the restart, Docker Desktop launches automatically. Wait for the whale icon in
+   the system tray to stop animating — this means Docker Engine is running
+
+### Step 8.2 — Allocate Enough Resources
+
+ArkCase requires at least 6 CPUs and 12 GB RAM. Docker Desktop limits resources to
+defaults that are often too low. Configure them before enabling Kubernetes:
+
+1. Open Docker Desktop
+2. Go to **Settings → Resources → Advanced**
+3. Set **CPUs** to at least **6**
+4. Set **Memory** to at least **12 GB** (12288 MB)
+5. Set **Disk image size** to at least **60 GB**
+6. Click **Apply & Restart**
+
+> **Why?** If Docker Desktop is under-resourced, ArkCase pods will be stuck in `Pending`
+> with `Insufficient memory` or `Insufficient cpu` events. Set this before deploying.
+
+### Step 8.3 — Enable Kubernetes
 
 1. Open Docker Desktop
 2. Go to **Settings → Kubernetes**
@@ -646,7 +718,10 @@ Download from: `https://www.docker.com/products/docker-desktop/`
 4. Click **Apply & Restart**
 5. Wait for the Kubernetes status indicator (bottom left) to turn green and show `Running`
 
-### Step 8.3 — Verify
+> This step downloads and configures a single-node Kubernetes cluster. It may take
+> 3–5 minutes on the first run.
+
+### Step 8.4 — Verify
 
 **PowerShell or Command Prompt:**
 
@@ -658,7 +733,7 @@ kubectl get nodes
 # docker-desktop   Ready    control-plane   1m    v1.x.x
 ```
 
-### Step 8.4 — Install kubectl (Windows)
+### Step 8.5 — Install kubectl (Windows)
 
 Docker Desktop installs kubectl automatically. If it is not found:
 
@@ -671,7 +746,7 @@ Or download the binary manually:
 `https://dl.k8s.io/release/v1.30.0/bin/windows/amd64/kubectl.exe`
 and place it somewhere on your `PATH`.
 
-### Step 8.5 — Install ingress-nginx
+### Step 8.6 — Install ingress-nginx
 
 Install Helm first ([Section 9](#9-install-helm)), then:
 
