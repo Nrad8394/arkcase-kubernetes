@@ -666,7 +666,7 @@ When the Ubuntu window opens for the first time, create a username and password 
 prompted. You can then close it — Docker Desktop uses WSL2 as a backend without
 requiring you to use the Linux shell directly.
 
-#### Verify WSL2 is running
+#### Verify WSL2 is installed/configured
 
 ```powershell
 wsl --list --verbose
