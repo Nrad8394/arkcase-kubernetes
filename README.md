@@ -501,11 +501,9 @@ sudo firewall-cmd --permanent --add-port=30000-32767/tcp
 sudo firewall-cmd --reload
 ```
 
-### Step 7.2 — Install containerd (All Nodes)
+### Step 7.2 — Install Container Runtime (All Nodes)
 
-containerd is the standard Kubernetes runtime and works on both Ubuntu and RHEL:
-
-**Ubuntu / Debian:**
+**Ubuntu / Debian — containerd:**
 
 ```bash
 sudo apt-get install -y containerd
@@ -518,26 +516,15 @@ sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/conf
 sudo systemctl enable --now containerd
 ```
 
-**RHEL / Rocky / AlmaLinux:**
-
-```bash
-# containerd is distributed via Docker's repo on RHEL
-sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
-sudo dnf install -y containerd.io
-
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml
-sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-
-sudo systemctl enable --now containerd
-```
+> **RHEL / Rocky / AlmaLinux:** Use CRI-O instead — it is installed together with the
+> Kubernetes packages in Step 7.3 below.
 
 ### Step 7.3 — Install Kubernetes Components (All Nodes)
 
 **Ubuntu / Debian:**
 
 ```bash
-KUBERNETES_VERSION=v1.30
+KUBERNETES_VERSION=v1.31
 
 curl -fsSL https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/deb/Release.key \
   | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
@@ -554,31 +541,101 @@ sudo systemctl enable --now kubelet
 
 **RHEL / Rocky / AlmaLinux:**
 
-```bash
-KUBERNETES_VERSION=v1.30
+Add the Kubernetes and CRI-O repos from the official Kubernetes community packages site,
+then install everything in a single command. Restricting to only these two repos avoids
+version conflicts with the system's other enabled repos.
 
+```bash
+# Add the Kubernetes repo (v1.31)
 cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
 [kubernetes]
 name=Kubernetes
-baseurl=https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/rpm/
+baseurl=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/
 enabled=1
 gpgcheck=1
-gpgkey=https://pkgs.k8s.io/core:/stable:/$KUBERNETES_VERSION/rpm/repodata/repomd.xml.key
-exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+gpgkey=https://pkgs.k8s.io/core:/stable:/v1.31/rpm/repodata/repomd.xml.key
 EOF
 
-sudo dnf makecache
-sudo dnf install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+# Add the CRI-O repo (v1.30 — minor version lag is intentional and supported)
+cat <<EOF | sudo tee /etc/yum.repos.d/cri-o.repo
+[cri-o]
+name=CRI-O
+baseurl=https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.30/rpm/
+enabled=1
+gpgcheck=1
+gpgkey=https://pkgs.k8s.io/addons:/cri-o:/stable:/v1.30/rpm/repodata/repomd.xml.key
+EOF
+
+# Clean yum metadata cache before installing
+sudo yum clean all
+
+# Install Kubernetes components and CRI-O together
+sudo yum install -y kubelet kubeadm kubectl cri-o \
+  --disablerepo="*" --enablerepo="kubernetes,cri-o"
+
+# Enable and start both services
+sudo systemctl daemon-reload
+sudo systemctl enable --now crio
 sudo systemctl enable --now kubelet
 ```
 
-### Step 7.4 — Initialize the Cluster (Control Plane Only)
+Verify all binaries are present:
+
+```bash
+which kubeadm kubectl crio
+# Expected: /usr/bin/kubeadm  /usr/bin/kubectl  /usr/bin/crio
+```
+
+### Step 7.3b — Fix DNS (RHEL only, if needed)
+
+On RHEL, NetworkManager may overwrite `/etc/resolv.conf` and point DNS to the local
+systemd-resolved stub (`[::1]:53`). If that stub is not running, `kubeadm` image pulls
+and cluster init will fail with `read: connection refused`. Fix this before proceeding.
+
+```bash
+# Pin resolv.conf to Google DNS
+echo -e "nameserver 8.8.8.8\nnameserver 8.8.4.4" | sudo tee /etc/resolv.conf
+
+# Lock the file so NetworkManager cannot overwrite it
+sudo chattr +i /etc/resolv.conf
+
+# Tell NetworkManager to stop managing DNS entirely
+sudo tee /etc/NetworkManager/conf.d/99-dns.conf <<EOF
+[main]
+dns=none
+EOF
+
+sudo systemctl reload NetworkManager
+```
+
+Verify DNS is working:
+
+```bash
+ping -c 2 registry.k8s.io
+# Should resolve and receive replies
+```
+
+### Step 7.4 — Pre-flight: Pull Control Plane Images (Control Plane Only)
+
+Pull the Kubernetes control plane container images before running `kubeadm init`.
+This verifies connectivity to `registry.k8s.io` and caches images so init does not time out.
+
+```bash
+sudo kubeadm config images pull
+# Expected: [config/images] Pulled registry.k8s.io/kube-apiserver:v1.31.x
+#           [config/images] Pulled registry.k8s.io/kube-controller-manager:v1.31.x
+#           ... (several images listed)
+```
+
+If this fails with a DNS or network error, complete Step 7.3b above first.
+
+### Step 7.5 — Initialize the Cluster (Control Plane Only)
 
 ```bash
 sudo kubeadm init --pod-network-cidr=10.244.0.0/16
 ```
 
-> ⚠️ The output prints a `kubeadm join` command. **Copy it now** — you need it for Step 7.6.
+> ⚠️ The output prints a `kubeadm join` command. **Copy it now** — you need it for Step 7.7.
 
 ```bash
 mkdir -p $HOME/.kube
@@ -589,7 +646,7 @@ kubectl get nodes
 # Control plane shows NotReady — normal until CNI is installed
 ```
 
-### Step 7.5 — Install CNI (Control Plane Only)
+### Step 7.6 — Install CNI (Control Plane Only)
 
 ```bash
 kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
@@ -598,9 +655,9 @@ kubectl get nodes -w
 # Ctrl+C when all nodes show Ready
 ```
 
-### Step 7.6 — Join Worker Nodes (Workers Only)
+### Step 7.7 — Join Worker Nodes (Workers Only)
 
-Run the `kubeadm join` command printed in Step 7.4:
+Run the `kubeadm join` command printed in Step 7.5:
 
 ```bash
 sudo kubeadm join <CONTROL_PLANE_IP>:6443 \
@@ -614,7 +671,7 @@ Verify from the control plane:
 kubectl get nodes
 ```
 
-### Step 7.7 — Install Ingress Controller (Control Plane Only)
+### Step 7.8 — Install Ingress Controller (Control Plane Only)
 
 ```bash
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
@@ -634,11 +691,98 @@ kubectl get pods -n ingress-nginx -w
 Docker Desktop is the recommended path for Windows and macOS. It ships with a built-in
 single-node Kubernetes cluster backed by containerd — no VM driver configuration needed.
 
+### Step 8.0 — Enable WSL2 (Windows only, required prerequisite)
+
+Docker Desktop on Windows requires WSL2 (Windows Subsystem for Linux 2). Run these steps
+in **PowerShell as Administrator** before installing Docker Desktop.
+
+#### Enable Windows features
+
+```powershell
+# Enable the two required Windows features
+dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+```
+
+**Restart your machine**, then continue in a new Administrator PowerShell session.
+
+#### Set WSL2 as the default version
+
+```powershell
+wsl --set-default-version 2
+```
+
+#### Install a Linux distribution (Ubuntu recommended)
+
+```powershell
+# Install Ubuntu from the Microsoft Store via winget
+winget install Canonical.Ubuntu.2204
+```
+
+When the Ubuntu window opens for the first time, create a username and password when
+prompted. You can then close it — Docker Desktop uses WSL2 as a backend without
+requiring you to use the Linux shell directly.
+
+#### Verify WSL2 is installed/configured
+
+```powershell
+wsl --list --verbose
+# Expected (State should be Running or Stopped, Version should be 2):
+# NAME            STATE   VERSION
+# Ubuntu-22.04    Stopped 2
+```
+
+> **Windows 11 / Windows 10 version 2004+ (build 19041+):** WSL2 is supported. Windows 10
+> version 1903/1909 can also run WSL2 on the backported builds. On older supported Windows 10
+> setups, install the [WSL2 Linux kernel update package](https://aka.ms/wsl2kernel) after the
+> feature enable step above if Windows does not install it automatically.
+
 ### Step 8.1 — Install Docker Desktop
 
-Download from: `https://www.docker.com/products/docker-desktop/`
+**Windows:**
 
-### Step 8.2 — Enable Kubernetes
+1. Download the installer from: `https://www.docker.com/products/docker-desktop/`
+   (choose **Windows — AMD64** unless you are on an ARM device)
+
+2. Run **Docker Desktop Installer.exe**
+
+3. On the configuration page, ensure **Use WSL 2 instead of Hyper-V** is checked
+
+4. Click **OK** and let the installer finish
+
+5. **Restart your machine** when prompted (or click *Close and restart*)
+
+6. After the restart, Docker Desktop launches automatically. Wait for the whale icon in
+   the system tray to stop animating — this means Docker Engine is running
+
+**macOS:**
+
+1. Download the installer from: `https://www.docker.com/products/docker-desktop/`
+   (choose **Mac — Apple Silicon** for M1/M2/M3 chips, or **Mac — Intel** for older Macs)
+
+2. Open the downloaded `.dmg` file and drag **Docker** to your **Applications** folder
+
+3. Launch Docker from Applications. Accept the service agreement when prompted
+
+4. Wait for the whale icon in the menu bar to stop animating — this means Docker Engine
+   is running
+
+### Step 8.2 — Allocate Enough Resources
+
+ArkCase requires at least 6 CPUs and 12 GB RAM. Docker Desktop limits resources to
+defaults that are often too low. Configure them before enabling Kubernetes:
+
+1. Open Docker Desktop
+2. Go to **Settings → Resources → Advanced**
+3. Set **CPUs** to at least **6**
+4. Set **Memory** to at least **12 GB** (12288 MB)
+5. Set **Disk image size** to at least **60 GB**
+6. Click **Apply & Restart**
+
+> **Why?** If Docker Desktop is under-resourced, ArkCase pods will be stuck in `Pending`
+> with `Insufficient memory` or `Insufficient cpu` events. Set this before deploying.
+
+### Step 8.3 — Enable Kubernetes
 
 1. Open Docker Desktop
 2. Go to **Settings → Kubernetes**
@@ -646,7 +790,10 @@ Download from: `https://www.docker.com/products/docker-desktop/`
 4. Click **Apply & Restart**
 5. Wait for the Kubernetes status indicator (bottom left) to turn green and show `Running`
 
-### Step 8.3 — Verify
+> This step downloads and configures a single-node Kubernetes cluster. It may take
+> 3–5 minutes on the first run.
+
+### Step 8.4 — Verify
 
 **PowerShell or Command Prompt:**
 
@@ -658,7 +805,7 @@ kubectl get nodes
 # docker-desktop   Ready    control-plane   1m    v1.x.x
 ```
 
-### Step 8.4 — Install kubectl (Windows)
+### Step 8.5 — Install kubectl (Windows)
 
 Docker Desktop installs kubectl automatically. If it is not found:
 
@@ -671,9 +818,10 @@ Or download the binary manually:
 `https://dl.k8s.io/release/v1.30.0/bin/windows/amd64/kubectl.exe`
 and place it somewhere on your `PATH`.
 
-### Step 8.5 — Install ingress-nginx
+### Step 8.6 — Install ingress-nginx
 
-Install Helm first ([Section 9](#9-install-helm)), then:
+> **Note:** This step requires Helm. If you have not installed it yet, go to
+> [Section 9 — Install Helm](#9-install-helm) now, then return here.
 
 ```powershell
 helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
@@ -687,7 +835,7 @@ kubectl get pods -n ingress-nginx -w
 # Ctrl+C when STATUS shows Running
 ```
 
-Now continue to [Section 9 — Install Helm](#9-install-helm).
+Now continue to [Section 10 — Add the ArkCase Helm Repo](#10-add-the-arkcase-helm-repo).
 
 ---
 
